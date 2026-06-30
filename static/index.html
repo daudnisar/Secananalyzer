@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SecAnalyzer — AI Log Analysis Pipeline</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9;
+    --accent:#58a6ff; --crit:#f85149; --high:#ff8c42; --med:#d29922; --low:#3fb950;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--text); font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:24px; }
+  h1 { font-size:22px; margin-bottom:4px; }
+  .sub { color:#8b949e; margin-bottom:20px; font-size:13px; }
+  .grid { display:grid; grid-template-columns: 360px 1fr; gap:20px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  label { font-size:12px; color:#8b949e; display:block; margin:10px 0 4px; }
+  textarea, select, input[type=file] { width:100%; background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:13px; }
+  textarea { height:140px; font-family: monospace; }
+  button { margin-top:14px; background:var(--accent); color:#0d1117; border:none; padding:10px 16px; border-radius:6px; font-weight:600; cursor:pointer; width:100%; }
+  button:hover { opacity:0.9; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+  .crit { background:var(--crit); color:#fff; } .high { background:var(--high); color:#000; }
+  .med { background:var(--med); color:#000; } .low { background:var(--low); color:#000; }
+  .det-card { border:1px solid var(--border); border-radius:8px; padding:10px; margin-bottom:10px; }
+  .det-card h3 { margin:0 0 6px; font-size:14px; }
+  .meta { font-size:12px; color:#8b949e; line-height:1.6; }
+  pre.llm { white-space:pre-wrap; background:#0d1117; border:1px solid var(--border); padding:12px; border-radius:8px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  th, td { border:1px solid var(--border); padding:6px; text-align:left; }
+  th { background:#1c2128; }
+  .score-box { display:flex; align-items:center; gap:14px; margin-bottom:14px;}
+  .score-num { font-size:36px; font-weight:800; }
+  #status { font-size:12px; color:#8b949e; margin-top:8px; }
+  .tab { display:none; }
+  .tab.active { display:block; }
+  .tabs { display:flex; gap:8px; margin-bottom:12px; }
+  .tabs button { width:auto; background:#21262d; color:var(--text); padding:6px 14px; }
+  .tabs button.active-tab { background:var(--accent); color:#0d1117; }
+</style>
+</head>
+<body>
+
+<h1>🛡️ SecAnalyzer</h1>
+<div class="sub">Logs → Parser → Normalizer → Detection Engine → Threat Intel → MITRE Mapper → Timeline → Risk Scoring → LLM Analysis → Incident Report</div>
+
+<div class="grid">
+  <div class="panel">
+    <label>Upload log file</label>
+    <input type="file" id="fileInput">
+
+    <label>...or paste raw log text</label>
+    <textarea id="logText" placeholder="Paste syslog / JSON / CEF / auth logs here..."></textarea>
+
+    <label>AI Provider (LLM Analysis step)</label>
+    <select id="providerSelect"><option>Loading providers...</option></select>
+    <div id="providerNote" class="meta"></div>
+
+    <button onclick="runAnalysis()">▶ Run Full Pipeline</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="panel">
+    <div class="tabs">
+      <button class="active-tab" onclick="showTab('overview')">Overview</button>
+      <button onclick="showTab('detections')">Detections</button>
+      <button onclick="showTab('timeline')">Timeline</button>
+      <button onclick="showTab('llm')">AI Analysis</button>
+      <button onclick="showTab('report')">Report</button>
+    </div>
+
+    <div id="overview" class="tab active">
+      <p class="meta">Run the pipeline to see results here.</p>
+    </div>
+    <div id="detections" class="tab"></div>
+    <div id="timeline" class="tab"></div>
+    <div id="llm" class="tab"></div>
+    <div id="report" class="tab"></div>
+  </div>
+</div>
+
+<script>
+let lastResult = null;
+
+async function loadProviders() {
+  const res = await fetch('/api/providers');
+  const providers = await res.json();
+  const sel = document.getElementById('providerSelect');
+  sel.innerHTML = '';
+  providers.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `${p.id} (${p.model}) ${p.configured ? '✅' : '⚠️ needs key'}`;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => {
+    const p = providers.find(x => x.id === sel.value);
+    document.getElementById('providerNote').textContent = p ? p.notes : '';
+  };
+  sel.onchange();
+}
+loadProviders();
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active-tab'));
+  document.getElementById(name).classList.add('active');
+  [...document.querySelectorAll('.tabs button')].find(b => b.textContent.toLowerCase().includes(name.slice(0,4))).classList.add('active-tab');
+}
+
+function sevClass(sev) {
+  sev = (sev||'').toLowerCase();
+  if (sev.includes('crit')) return 'crit';
+  if (sev.includes('high')) return 'high';
+  if (sev.includes('med')) return 'med';
+  return 'low';
+}
+
+async function runAnalysis() {
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = 'Running pipeline... this may take a few seconds.';
+  const fileInput = document.getElementById('fileInput');
+  const logText = document.getElementById('logText').value;
+  const provider = document.getElementById('providerSelect').value;
+
+  const fd = new FormData();
+  if (fileInput.files.length > 0) fd.append('file', fileInput.files[0]);
+  if (logText.trim()) fd.append('log_text', logText);
+  fd.append('llm_provider', provider);
+  fd.append('run_llm', true);
+
+  try {
+    const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+    lastResult = data;
+    renderOverview(data);
+    renderDetections(data);
+    renderTimeline(data);
+    renderLLM(data);
+    renderReport(data);
+    statusEl.textContent = '✅ Done. ' + data.event_count + ' events analyzed, ' + data.detections.length + ' detections found.';
+  } catch (e) {
+    statusEl.textContent = 'Request failed: ' + e;
+  }
+}
+
+function renderOverview(data) {
+  const r = data.overall_risk;
+  document.getElementById('overview').innerHTML = `
+    <div class="score-box">
+      <div class="score-num">${r.score}</div>
+      <div><span class="badge ${sevClass(r.label)}">${r.label}</span><div class="meta">Overall Incident Risk</div></div>
+    </div>
+    <div class="meta">
+      Events analyzed: <b>${data.event_count}</b><br>
+      Detections triggered: <b>${data.detections.length}</b><br>
+      Timeline span: ${data.timeline_summary.start || '-'} → ${data.timeline_summary.end || '-'} (${data.timeline_summary.duration_minutes} min)
+    </div>
+  `;
+}
+
+function renderDetections(data) {
+  if (!data.detections.length) {
+    document.getElementById('detections').innerHTML = '<p class="meta">No detections triggered.</p>';
+    return;
+  }
+  document.getElementById('detections').innerHTML = data.detections.map(d => `
+    <div class="det-card">
+      <h3>${d.rule} <span class="badge ${sevClass(d.risk_label)}">${d.risk_label} (${d.risk_score})</span></h3>
+      <div class="meta">
+        MITRE: ${d.mitre.tactic} — ${d.mitre.technique} (${d.mitre.technique_id})<br>
+        ${d.src_ip ? 'Source IP: ' + d.src_ip + '<br>' : ''}
+        ${d.user ? 'User: ' + d.user + '<br>' : ''}
+        ${(d.threat_intel||[]).map(t => `Threat Intel (${t.ip}): ${t.reputation}`).join('<br>')}
+        <br>${d.description}
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderTimeline(data) {
+  const rows = data.timeline.slice(0, 100).map(t => `
+    <tr><td>${t.timestamp||''}</td><td>${t.rule}</td><td>${t.severity}</td>
+    <td>${t.src_ip||'-'}</td><td>${t.user||'-'}</td><td>${(t.message||'').slice(0,80)}</td></tr>
+  `).join('');
+  document.getElementById('timeline').innerHTML = `
+    <table><tr><th>Time</th><th>Rule</th><th>Sev</th><th>Src IP</th><th>User</th><th>Message</th></tr>${rows}</table>
+  `;
+}
+
+function renderLLM(data) {
+  const llm = data.llm_result;
+  document.getElementById('llm').innerHTML = llm.error
+    ? `<p class="meta">⚠️ ${llm.error}</p>`
+    : `<div class="meta">Provider: ${llm.provider} (${llm.model||''})</div><pre class="llm">${(llm.analysis||'').replace(/</g,'&lt;')}</pre>`;
+}
+
+function renderReport(data) {
+  document.getElementById('report').innerHTML = `
+    <p class="meta">Full Markdown + JSON report saved.</p>
+    <a href="/api/report/${data.report_files.markdown}" target="_blank"><button style="width:auto;margin-right:8px;">⬇ Download Markdown</button></a>
+    <a href="/api/report/${data.report_files.json}" target="_blank"><button style="width:auto;">⬇ Download JSON</button></a>
+    <pre class="llm">${data.report_markdown.replace(/</g,'&lt;')}</pre>
+  `;
+}
+</script>
+</body>
+</html>
